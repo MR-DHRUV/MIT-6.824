@@ -24,9 +24,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"../labgob"
-
-	"../labrpc"
+	"6.824/src/labgob"
+	"6.824/src/labrpc"
 )
 
 // import "bytes"
@@ -121,7 +120,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	return rf.state.persistentState.currentTerm, rf.state.volatileState.role == Leader
+	return rf.state.PersistentState.CurrentTerm, rf.state.VolatileState.Role == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -388,12 +387,51 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) sendHeartBeats() {
+	rf.mu.Lock()
+	currTerm := rf.state.PersistentState.CurrentTerm
+	rf.mu.Unlock()
+
+	for peerIdx := range rf.peers {
+		if peerIdx != rf.me {
+			go func(idx int) {
+				
+				args := &AppendEntriesArgs{
+					Term: currTerm,
+					LeaderId: rf.me,
+				}
+				reply := &AppendEntriesReply{}
+
+				if rf.sendAppendEntries(idx, args, reply) {
+					// Another leader is elected
+					if reply.Term > currTerm {
+						rf.mu.Lock()
+
+						if rf.state.VolatileState.Role == Leader && reply.Term > rf.state.PersistentState.CurrentTerm {
+							rf.state.VolatileState.Role = Follower
+							rf.state.PersistentState.CurrentTerm = reply.Term
+							rf.state.PersistentState.VotedFor = -1
+							rf.resetTimer()
+						}
+
+						rf.mu.Unlock()
+						return
+					}
+				}
+			}(peerIdx)
+		}
+	}
+}
+
 func (rf *Raft) startLeaderLoop() {
+
+	rf.sendHeartBeats()
 
 	tickCh := time.NewTicker(HEARTBEAT_INTERVAL)
 	defer tickCh.Stop()
 
 	for !rf.killed() {
+		<-tickCh.C // wait for the tick
 		
 		rf.mu.Lock()
 		if rf.state.VolatileState.Role != Leader {
@@ -402,7 +440,7 @@ func (rf *Raft) startLeaderLoop() {
 		}
 
 		rf.mu.Unlock()
-
+		rf.sendHeartBeats()
 	}
 }
 
@@ -462,11 +500,16 @@ func (rf *Raft) startElection() {
 							// Since in current server multiple elections can take place
 							if rf.state.VolatileState.Role == Candidate && rf.state.PersistentState.CurrentTerm == currTerm {
 								rf.state.VolatileState.Role = Leader
-
 								isLeader = true
 							}
 
 							rf.mu.Unlock()
+
+							// start the leader process
+							if isLeader {
+								go rf.startLeaderLoop()
+							}
+
 							return
 						}
 					}
@@ -474,10 +517,6 @@ func (rf *Raft) startElection() {
 
 			}(peerIdx)
 		}
-	}
-
-	if isLeader {
-		go rf.startLeaderLoop()
 	}
 }
 
