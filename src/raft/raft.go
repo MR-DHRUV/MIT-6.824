@@ -333,15 +333,22 @@ type AppendEntriesReply struct {
 
 // The caller must hold the lock before calling this function
 func (rf *Raft) notifyUpStreamApp(prevCommitIndex, newCommitIndex int) {
-	for i := prevCommitIndex + 1; i <= newCommitIndex; i++ {
-		if rf.applyCh != nil {
-			rf.applyCh <- ApplyMsg{
-				Command:      rf.state.PersistentState.Logs[i].Command,
-				CommandValid: true,
-				CommandIndex: i,
+	entries := append(
+		[]LogEntry(nil),
+		rf.state.PersistentState.Logs[prevCommitIndex+1:newCommitIndex+1]...
+	)
+
+	go func(startIndex int, entries []LogEntry) {
+		for i, entry := range entries {
+			if rf.applyCh != nil {
+				rf.applyCh <- ApplyMsg{
+					Command:      entry.Command,
+					CommandValid: true,
+					CommandIndex: startIndex + i,
+				}
 			}
 		}
-	}
+	}(prevCommitIndex+1, entries)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
