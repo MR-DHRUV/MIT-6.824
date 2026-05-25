@@ -105,6 +105,7 @@ type Raft struct {
 	timer *time.Timer
 }
 
+// The caller must hold the lock before calling this function
 func (rf *Raft) resetTimer() {
 	// calc a random delay in MIN_TIMEOUT and MAX_TIMEOUT interval
 	delay := MIN_TIMEOUT + time.Duration(rand.Intn(int(MAX_TIMEOUT-MIN_TIMEOUT)))
@@ -135,9 +136,7 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.state.PersistentState.CurrentTerm, rf.state.VolatileState.Role == Leader
 }
 
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
+// The caller must hold the lock before calling this function
 func (rf *Raft) persist() {
 	buff := new(bytes.Buffer)
 	e := labgob.NewEncoder(buff)
@@ -182,6 +181,46 @@ func (rf *Raft) initState(data []byte) {
 	rf.state = state
 }
 
+// The caller must hold the lock before calling this function
+func (rf *Raft) becomeFollower(term int, leaderId int, votedFor int) {
+	rf.state.VolatileState.Role = Follower
+	rf.state.VolatileState.LeaderId = leaderId
+
+	rf.state.PersistentState.CurrentTerm = term
+	rf.state.PersistentState.VotedFor = votedFor
+
+	rf.persist()
+	rf.resetTimer()
+}
+
+// The caller must hold the lock before calling this function
+func (rf *Raft) becomeCandidate() {
+	rf.state.VolatileState.Role = Candidate
+	rf.state.PersistentState.CurrentTerm++
+	rf.state.PersistentState.VotedFor = rf.me
+
+	rf.persist()
+	rf.resetTimer()
+}
+
+// The caller must hold the lock before calling this function
+func (rf *Raft) becomeLeader() {
+	rf.state.VolatileState.Role = Leader
+	rf.state.VolatileState.LeaderId = rf.me
+
+	rf.state.VolatileState.NextIndex = make([]int, len(rf.peers))
+	rf.state.VolatileState.MatchIndex = make([]int, len(rf.peers))
+
+	logLen := len(rf.state.PersistentState.Logs)
+
+	for i := range rf.peers {
+		rf.state.VolatileState.NextIndex[i] = logLen
+		rf.state.VolatileState.MatchIndex[i] = 0
+	}
+
+	rf.state.VolatileState.MatchIndex[rf.me] = logLen - 1
+}
+
 // RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
 	Term         int // candidate's term
@@ -217,9 +256,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// if term is newer
 	if currentTerm < args.Term {
-		rf.state.PersistentState.CurrentTerm = args.Term
-		rf.state.PersistentState.VotedFor = -1
-		rf.state.VolatileState.Role = Follower
+		rf.becomeFollower(args.Term, -1, -1)
 
 		currentTerm = args.Term
 		votedFor = -1
@@ -240,14 +277,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// Grant Vote
-	rf.state.PersistentState.VotedFor = args.CandidateId
-	rf.state.VolatileState.Role = Follower
-
 	reply.VoteGranted = true
 	reply.Term = args.Term
 
-	rf.persist()
-	rf.resetTimer()
+	rf.becomeFollower(args.Term, -1, args.CandidateId)
 }
 
 // code to send a RequestVote RPC to a server.
@@ -298,6 +331,7 @@ type AppendEntriesReply struct {
 	ConflictTerm  int
 }
 
+// The caller must hold the lock before calling this function
 func (rf *Raft) notifyUpStreamApp(prevCommitIndex, newCommitIndex int) {
 	for i := prevCommitIndex + 1; i <= newCommitIndex; i++ {
 		if rf.applyCh != nil {
@@ -326,8 +360,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// if term is newer
 	if currentTerm < args.Term {
-		rf.state.PersistentState.CurrentTerm = args.Term
-		rf.state.PersistentState.VotedFor = -1
+		rf.becomeFollower(args.Term, args.LeaderId, -1)
 	}
 
 	if lastLogIdx < args.PrevLogIndex {
@@ -394,7 +427,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state.VolatileState.CommitIndex = newCommitIndex
 	}
 
-	rf.state.VolatileState.Role = Follower
+	// rf.state.VolatileState.Role = Follower
 
 	reply.Success = true
 	reply.Term = rf.state.PersistentState.CurrentTerm
@@ -461,6 +494,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// The caller must hold the lock before calling this function
 func (rf *Raft) updateCommitIndex() {
 	logLen := len(rf.state.PersistentState.Logs)
 
@@ -510,10 +544,7 @@ func (rf *Raft) replicateToPeer(peerIdx int) {
 		// Another leader is elected
 		if reply.Term > currTerm {
 			if rf.state.VolatileState.Role == Leader && reply.Term > rf.state.PersistentState.CurrentTerm {
-				rf.state.VolatileState.Role = Follower
-				rf.state.PersistentState.CurrentTerm = reply.Term
-				rf.state.PersistentState.VotedFor = -1
-				rf.resetTimer()
+				rf.becomeFollower(reply.Term, -1, -1)
 			}
 		} else if reply.Success == false {
 			// decrement nextIndex
@@ -586,37 +617,15 @@ func (rf *Raft) startLeaderLoop() {
 	}
 }
 
-func (rf *Raft) initLeaderState() {
-	rf.state.VolatileState.Role = Leader
-	rf.state.VolatileState.LeaderId = rf.me
-
-	rf.state.VolatileState.NextIndex = make([]int, len(rf.peers))
-	rf.state.VolatileState.MatchIndex = make([]int, len(rf.peers))
-
-	logLen := len(rf.state.PersistentState.Logs)
-
-	for i := range rf.peers {
-		rf.state.VolatileState.NextIndex[i] = logLen
-		rf.state.VolatileState.MatchIndex[i] = 0
-	}
-
-	rf.state.VolatileState.MatchIndex[rf.me] = logLen - 1
-}
-
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	rf.resetTimer() // reset timer for election timeout
 
-	rf.state.VolatileState.Role = Candidate
-
-	rf.state.PersistentState.CurrentTerm++
-	rf.state.PersistentState.VotedFor = rf.me
+	rf.becomeCandidate()
 
 	currTerm := rf.state.PersistentState.CurrentTerm
 	LastLogIndex := len(rf.state.PersistentState.Logs) - 1
 	LastLogTerm := rf.state.PersistentState.Logs[LastLogIndex].Term
 
-	rf.persist()
 	rf.mu.Unlock()
 
 	var votes int32 = 1 // vote for self
@@ -639,10 +648,7 @@ func (rf *Raft) startElection() {
 						rf.mu.Lock()
 
 						if rf.state.VolatileState.Role == Candidate && reply.Term > rf.state.PersistentState.CurrentTerm {
-							rf.state.VolatileState.Role = Follower
-							rf.state.PersistentState.CurrentTerm = reply.Term
-							rf.state.PersistentState.VotedFor = -1
-							rf.resetTimer()
+							rf.becomeFollower(reply.Term, -1, -1)
 						}
 
 						rf.mu.Unlock()
@@ -660,7 +666,7 @@ func (rf *Raft) startElection() {
 							// Since in current server multiple elections can take place
 							if rf.state.VolatileState.Role == Candidate && rf.state.PersistentState.CurrentTerm == currTerm {
 								isLeader = true
-								rf.initLeaderState()
+								rf.becomeLeader()
 							}
 
 							rf.mu.Unlock()
