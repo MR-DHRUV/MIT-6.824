@@ -139,14 +139,10 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	buff := new(bytes.Buffer)
+	e := labgob.NewEncoder(buff)
+	e.Encode(rf.state.PersistentState)
+	rf.persister.SaveRaftState(buff.Bytes())
 }
 
 // restore previously persisted state.
@@ -250,6 +246,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	reply.Term = args.Term
 
+	rf.persist()
 	rf.resetTimer()
 }
 
@@ -402,6 +399,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	reply.Term = rf.state.PersistentState.CurrentTerm
 
+	rf.persist()
 	rf.resetTimer()
 }
 
@@ -439,6 +437,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// push back
 	rf.state.PersistentState.Logs = append(rf.state.PersistentState.Logs, entry)
+	rf.persist()
 
 	return idx, rf.state.PersistentState.CurrentTerm, true
 }
@@ -617,6 +616,7 @@ func (rf *Raft) startElection() {
 	LastLogIndex := len(rf.state.PersistentState.Logs) - 1
 	LastLogTerm := rf.state.PersistentState.Logs[LastLogIndex].Term
 
+	rf.persist()
 	rf.mu.Unlock()
 
 	var votes int32 = 1 // vote for self
