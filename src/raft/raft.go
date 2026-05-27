@@ -28,8 +28,6 @@ import (
 	"6.824/src/labrpc"
 )
 
-// import "bytes"
-// import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -335,7 +333,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) notifyUpStreamApp(prevCommitIndex, newCommitIndex int) {
 	entries := append(
 		[]LogEntry(nil),
-		rf.state.PersistentState.Logs[prevCommitIndex+1:newCommitIndex+1]...
+		rf.state.PersistentState.Logs[prevCommitIndex+1:newCommitIndex+1]...,
 	)
 
 	go func(startIndex int, entries []LogEntry) {
@@ -378,6 +376,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// At this point its known that req is from a valid leader
+	rf.state.VolatileState.LeaderId = args.LeaderId
+
+	// I'm behind leader
 	if rf.state.PersistentState.Logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 
 		// find first log with same term as prevLogTerm
