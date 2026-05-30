@@ -98,6 +98,7 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	state     *RaftState          // Raft State
 	applyCh   chan ApplyMsg       // channel to send ApplyMsg to the service
+	applyCond *sync.Cond
 
 	// store some timeout channel
 	timer *time.Timer
@@ -331,22 +332,7 @@ type AppendEntriesReply struct {
 
 // The caller must hold the lock before calling this function
 func (rf *Raft) notifyUpStreamApp(prevCommitIndex, newCommitIndex int) {
-	entries := append(
-		[]LogEntry(nil),
-		rf.state.PersistentState.Logs[prevCommitIndex+1:newCommitIndex+1]...,
-	)
-
-	go func(startIndex int, entries []LogEntry) {
-		for i, entry := range entries {
-			if rf.applyCh != nil {
-				rf.applyCh <- ApplyMsg{
-					Command:      entry.Command,
-					CommandValid: true,
-					CommandIndex: startIndex + i,
-				}
-			}
-		}
-	}(prevCommitIndex+1, entries)
+	rf.applyCond.Signal() // notify the sleaping goroutine about new entries
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -495,7 +481,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+	rf.applyCond.Signal()
 }
 
 func (rf *Raft) killed() bool {
@@ -527,6 +513,11 @@ func (rf *Raft) updateCommitIndex() {
 
 func (rf *Raft) replicateToPeer(peerIdx int) {
 	rf.mu.Lock()
+
+	if rf.state.VolatileState.Role != Leader || rf.killed() {
+		rf.mu.Unlock()
+		return
+	}
 
 	currTerm := rf.state.PersistentState.CurrentTerm
 	commitIndex := rf.state.VolatileState.CommitIndex
@@ -710,6 +701,40 @@ func (rf *Raft) timeoutLoop() {
 	}
 }
 
+func (rf *Raft) applyLoop() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+
+		for rf.state.VolatileState.CommitIndex <= rf.state.VolatileState.LastApplied {
+			if rf.killed() {
+				rf.mu.Unlock()
+				return
+			}
+			rf.applyCond.Wait() // this will release all the locks held
+			// lock will be reapplied on wakeup
+		}
+
+		start := rf.state.VolatileState.LastApplied + 1
+		end := rf.state.VolatileState.CommitIndex
+		entries := append([]LogEntry(nil), rf.state.PersistentState.Logs[start:end+1]...)
+		rf.state.VolatileState.LastApplied = end
+		rf.mu.Unlock()
+
+		for i, entry := range entries {
+			if rf.killed() {
+				return
+			}
+			if rf.applyCh != nil {
+				rf.applyCh <- ApplyMsg{
+					Command:      entry.Command,
+					CommandValid: true,
+					CommandIndex: start + i,
+				}
+			}
+		}
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -726,12 +751,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// initialize state from persister or default state if no persisted state
 	rf.initState(persister.ReadRaftState())
 	rf.resetTimer()
 
 	go rf.timeoutLoop()
+	go rf.applyLoop()
 
 	return rf
 }
